@@ -6,24 +6,29 @@ from datetime import datetime
 from pathlib import Path
 import os
 
+import imaplib
+import email
+import re
+
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
-sys.path.append(r"C:\Progamas Compartido\utils")
-from Conexion_Hana import connect_to_database_sqlserver
+from Conexion import connect_to_database_sqlserver
+from Kobra_Enviar_Correo import enviar_alertas_importacion
 
 from dotenv import load_dotenv
+
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-# EMAIL = "jespinosav@guanajuato.gob.mx"
-# PASSWORD = "uUE0C3oaqRC1"
-
 EMAIL = os.getenv('Email')
 PASSWORD = os.getenv('Password')
+GMAIL_APP_PASSWORD = os.getenv('GMAIL_APP_PASSWORD')
 
 IMPORTACIONES_URL = "https://admin.kobra.red/importacion"
-LOG_PATH = Path(__file__).with_name("Kobra_Importaciones_Log.txt")
+LOG_PATH = BASE_DIR / "Logs" / "Kobra_Importaciones_Log.txt"
+SESSION_PATH = BASE_DIR / "Sesion" / "sesion_kobra.json" # <--- NUEVA LÍNEA
+
 LIMITE_FILAS = 6
 ESPERA_SEGUNDOS = 300
 SQLSERVER_DATABASE = "VISITAS_KOBRA"
@@ -155,7 +160,7 @@ def extraer_tabla(page, header_map, expected_fields, row_limit=None, debug_nombr
     if not encabezados:
         encabezados = obtener_textos_visibles(page, "table tr th")
 
-    print(f"DEBUG {debug_nombre} encabezados:", encabezados)
+    #print(f"DEBUG {debug_nombre} encabezados:", encabezados)
 
     indices = {}
     for idx, encabezado in enumerate(encabezados):
@@ -163,7 +168,7 @@ def extraer_tabla(page, header_map, expected_fields, row_limit=None, debug_nombr
         if campo and campo not in indices:
             indices[campo] = idx
 
-    print(f"DEBUG {debug_nombre} indices:", indices)
+    #print(f"DEBUG {debug_nombre} indices:", indices)
 
     filas = page.query_selector_all("table tbody tr")
     if row_limit is not None:
@@ -177,7 +182,7 @@ def extraer_tabla(page, header_map, expected_fields, row_limit=None, debug_nombr
         columnas = obtener_textos_visibles(fila, "td")
         columnas = limpiar_columnas_iniciales_vacias(columnas, encabezados)
 
-        print(f"DEBUG {debug_nombre} fila {i} columnas:", columnas)
+        #print(f"DEBUG {debug_nombre} fila {i} columnas:", columnas)
 
         if not indices:
             continue
@@ -192,6 +197,60 @@ def extraer_tabla(page, header_map, expected_fields, row_limit=None, debug_nombr
 
     return registros
 
+def obtener_codigo_gmail(email_user, app_password, max_intentos=10):
+    """Se conecta a Gmail vía IMAP, busca el correo de Kobra y extrae el código de 6 dígitos."""
+    print("📧 Conectando a Gmail para buscar el código...")
+    
+    try:
+        # Conectarse al servidor IMAP de Gmail
+        mail = imaplib.IMAP4_SSL('imap.gmail.com')
+        mail.login(email_user, app_password)
+        mail.select('inbox')
+        
+        for intento in range(max_intentos):
+            print(f"🔎 Buscando correo de Kobra (Intento {intento+1}/{max_intentos})...")
+            
+            # Buscar correos no leídos enviados por Kobra
+            status, mensajes = mail.search(None, '(UNSEEN FROM "no-reply@kobra.red")')
+            
+            ids_correos = mensajes[0].split()
+            if ids_correos:
+                # Tomar el correo más reciente
+                ultimo_id = ids_correos[-1]
+                res, msg_data = mail.fetch(ultimo_id, '(RFC822)')
+                
+                for response_part in msg_data:
+                    if isinstance(response_part, tuple):
+                        msg = email.message_from_bytes(response_part[1])
+                        
+                        # Extraer el cuerpo del correo
+                        cuerpo = ""
+                        if msg.is_multipart():
+                            for part in msg.walk():
+                                if part.get_content_type() == "text/plain":
+                                    cuerpo = part.get_payload(decode=True).decode('utf-8')
+                                    break
+                        else:
+                            cuerpo = msg.get_payload(decode=True).decode('utf-8')
+                        
+                        # Usar RegEx para encontrar exactamente 6 dígitos seguidos
+                        match = re.search(r'\b\d{6}\b', cuerpo)
+                        if match:
+                            codigo = match.group(0)
+                            print(f"✅ ¡Código encontrado en Gmail!: {codigo}")
+                            mail.logout()
+                            return codigo
+                            
+            # Si no encontró el correo, espera 3 segundos y vuelve a intentar
+            time.sleep(3)
+            
+        print("⚠️ Se agotó el tiempo esperando el correo de Kobra.")
+        mail.logout()
+        return None
+        
+    except Exception as e:
+        print(f"❌ Error al leer Gmail: {e}")
+        return None
 
 def login(page):
     print("🌐 Abriendo login...")
@@ -203,11 +262,44 @@ def login(page):
     page.fill('input[formcontrolname="contrasena"]', PASSWORD)
     page.click('button:has-text("Iniciar")')
 
-    print("📩 Ingresa el código en la página...")
-    input("👉 Presiona ENTER cuando ya estés dentro...")
+    # Le damos 5 segundos de gracia al servidor de Kobra para que envíe el correo
+    print("⏳ Esperando 5 segundos a que llegue el correo nuevo...")
+    time.sleep(5)
 
-    page.wait_for_url("https://admin.kobra.red/**")
-    print("✅ Login exitoso")
+    # El sistema envía el correo en este momento. Llamamos a nuestra función:
+    codigo = obtener_codigo_gmail(EMAIL, GMAIL_APP_PASSWORD)
+    
+    if codigo:
+        print("⌨️ Escribiendo código de verificación...")
+        
+        # AQUÍ ESTÁ CORREGIDO: Usamos codigo2FA
+        page.wait_for_selector('input[formcontrolname="codigo2FA"]', timeout=5000) 
+        page.fill('input[formcontrolname="codigo2FA"]', codigo)
+        
+        # Haz clic en el botón con el texto exacto de tu HTML
+        try:
+            page.click('button:has-text("Verificar código")')
+        except:
+            page.keyboard.press("Enter")
+            
+        # --- EL CAMBIO ESTÁ AQUÍ ---
+        print("⏳ Esperando a que el sistema valide el código...")
+        
+        # Esperamos a que la URL cambie y ya NO contenga "auth"
+        page.wait_for_url(lambda url: "auth" not in url.lower(), timeout=15000)
+        
+        # Pausa estratégica de 3 segundos para que Angular termine de guardar la sesión
+        page.wait_for_timeout(3000) 
+        print("✅ Login exitoso 100% automatizado")
+
+        # --- NUEVA LÍNEA: Guardar la sesión ---
+        page.context.storage_state(path=SESSION_PATH)
+        print("💾 Sesión guardada para futuras ejecuciones.")
+        # --------------------------------------
+
+    else:
+        print("❌ No se pudo automatizar el código. Por favor, ingrésalo manualmente.")
+        input("👉 Presiona ENTER cuando ya estés dentro...")
 
 
 def obtener_importaciones(page, limite=LIMITE_FILAS):
@@ -245,7 +337,7 @@ def obtener_importaciones(page, limite=LIMITE_FILAS):
             "usuario": registro.get("usuario") or None,
             "fecha_creada": convertir_fecha_sql(registro.get("fecha_creada")),
         }
-        print("🧾 Importación lista para SQL:", registro_sql)
+        #print("🧾 Importación lista para SQL:", registro_sql)
         importaciones.append(registro_sql)
 
     return importaciones
@@ -372,7 +464,7 @@ def obtener_detalle_por_lote(page, id_lote):
             "resultado": registro.get("resultado") or None,
             "probabilidad_visita": registro.get("probabilidad_visita") or None,
         }
-        print("🧾 Detalle listo para SQL:", detalle_sql)
+        #print("🧾 Detalle listo para SQL:", detalle_sql)
         detalles.append(detalle_sql)
 
     cerrar_modal_detalle(page)
@@ -565,71 +657,104 @@ def insertar_detalles_lote(conn, id_lote, detalles):
 
 
 def instalar_boton_manual(page):
-    page.expose_binding("ejecutarProcesoKobra", on_manual_button_click)
-    page.add_init_script(
-        """
-        (() => {
-            const BUTTON_ID = "codex-kobra-run-button";
+    """Inserta un botón flotante circular con ícono de 'Play' y lo enlaza a Python."""
+    print("🎨 Instalando botón flotante de ejecución manual...")
+    
+    # Exponemos la función a JS para que el botón pueda avisarle a Python
+    try:
+        page.expose_binding("ejecutarProcesoKobra", on_manual_button_click)
+    except Exception:
+        pass # Ignorar si ya estaba expuesta en la sesión reanudada
+        
+    js_code = """
+    (() => {
+        const BUTTON_ID = "codex-kobra-run-button";
 
-            function crearBoton() {
-                if (!window.location.href.startsWith("https://admin.kobra.red/importacion")) {
-                    return;
-                }
-
-                if (window.location.pathname !== "/importacion") {
-                    return;
-                }
-
-                if (document.getElementById(BUTTON_ID)) {
-                    return;
-                }
-
-                const boton = document.createElement("button");
-                boton.id = BUTTON_ID;
-                boton.type = "button";
-                boton.textContent = "Ejecutar Proceso";
-                boton.style.position = "fixed";
-                boton.style.top = "10px";
-                boton.style.right = "330px";
-                boton.style.zIndex = "99999";
-                boton.style.padding = "12px 18px";
-                boton.style.border = "none";
-                boton.style.borderRadius = "10px";
-                boton.style.background = "#0f766e";
-                boton.style.color = "#fff";
-                boton.style.fontWeight = "700";
-                boton.style.fontSize = "14px";
-                boton.style.boxShadow = "0 10px 24px rgba(15, 118, 110, 0.28)";
-                boton.style.cursor = "pointer";
-
-                boton.addEventListener("click", async () => {
-                    boton.disabled = true;
-                    const textoOriginal = boton.textContent;
-                    boton.textContent = "Solicitado...";
-
-                    try {
-                        if (window.ejecutarProcesoKobra) {
-                            await window.ejecutarProcesoKobra();
-                        }
-                    } catch (error) {
-                        console.error("No se pudo solicitar la ejecución manual", error);
-                    } finally {
-                        setTimeout(() => {
-                            boton.disabled = false;
-                            boton.textContent = textoOriginal;
-                        }, 2000);
-                    }
-                });
-
-                document.body.appendChild(boton);
+        function crearBoton() {
+            // Solo mostrar en la página de importaciones
+            if (!window.location.href.startsWith("https://admin.kobra.red/importacion")) {
+                return;
             }
 
-            window.addEventListener("load", () => setTimeout(crearBoton, 1200));
-            setInterval(crearBoton, 1500);
-        })();
-        """
-    )
+            // Si ya existe, no duplicarlo
+            if (document.getElementById(BUTTON_ID)) {
+                return;
+            }
 
+            // Crear el botón flotante (FAB)
+            const boton = document.createElement("button");
+            boton.id = BUTTON_ID;
+            boton.type = "button";
+            boton.title = "Ejecutar Proceso Ahora"; // Tooltip nativo al pasar el mouse
+            
+            // Estilos CSS inyectados directamente
+            boton.style.position = "fixed";
+            boton.style.bottom = "30px";
+            boton.style.right = "30px";
+            boton.style.zIndex = "99999";
+            boton.style.width = "60px";
+            boton.style.height = "60px";
+            boton.style.borderRadius = "50%";
+            boton.style.backgroundColor = "#2196F3"; // Azul Material
+            boton.style.color = "#ffffff";
+            boton.style.border = "none";
+            boton.style.boxShadow = "0 4px 10px rgba(0,0,0,0.3)";
+            boton.style.cursor = "pointer";
+            boton.style.display = "flex";
+            boton.style.alignItems = "center";
+            boton.style.justifyContent = "center";
+            boton.style.transition = "transform 0.2s, background-color 0.2s";
+
+            // Íconos SVG (Play y Cargando)
+            const playIcon = `<svg style="width:32px;height:32px" viewBox="0 0 24 24"><path fill="currentColor" d="M8,5.14V19.14L19,12.14L8,5.14Z" /></svg>`;
+            const waitIcon = `<svg style="width:32px;height:32px" viewBox="0 0 24 24"><path fill="currentColor" d="M12,4V2A10,10 0 0,0 2,12H4A8,8 0 0,1 12,4Z"><animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="1s" repeatCount="indefinite"/></path></svg>`;
+
+            boton.innerHTML = playIcon;
+
+            // Efectos visuales al pasar el mouse
+            boton.addEventListener("mouseover", () => {
+                boton.style.backgroundColor = "#1976D2"; // Azul oscuro
+                boton.style.transform = "scale(1.1)"; // Crece un poco
+            });
+            boton.addEventListener("mouseout", () => {
+                boton.style.backgroundColor = "#2196F3";
+                boton.style.transform = "scale(1)";
+            });
+
+            // Acción al hacer clic
+            boton.addEventListener("click", async () => {
+                boton.disabled = true;
+                boton.innerHTML = waitIcon; // Muestra ícono girando
+                boton.style.backgroundColor = "#4CAF50"; // Cambia a Verde
+
+                try {
+                    // Llama a la función de Python
+                    if (window.ejecutarProcesoKobra) {
+                        await window.ejecutarProcesoKobra();
+                    }
+                } catch (error) {
+                    console.error("No se pudo solicitar la ejecución manual", error);
+                } finally {
+                    // Restaurar botón después de 2 segundos
+                    setTimeout(() => {
+                        boton.disabled = false;
+                        boton.innerHTML = playIcon;
+                        boton.style.backgroundColor = "#2196F3";
+                    }, 2000);
+                }
+            });
+
+            document.body.appendChild(boton);
+        }
+
+        // Ejecutar al cargar y revisar constantemente si sigue ahí
+        window.addEventListener("load", () => setTimeout(crearBoton, 1200));
+        setInterval(crearBoton, 1500);
+    })();
+    """
+    
+    # Inyectamos el script para que sobreviva a recargas de página
+    page.add_init_script(js_code)
 
 def on_manual_button_click(source):
     global MANUAL_TRIGGER_REQUESTED
@@ -715,6 +840,15 @@ def ejecutar_ciclo(page):
             if omitido:
                 resultado["lotes_omitidos_detalle"].append(id_lote)
 
+        # ------------- NUEVA FUNCIONALIDAD DE CORREOS -------------
+        try:
+            enviar_alertas_importacion(conn)
+        except Exception as e:
+            mensaje = f"Error al procesar notificaciones por correo: {e}"
+            print(f"❌ {mensaje}")
+            resultado["errores"].append(mensaje)
+        # ----------------------------------------------------------
+
     except Exception as exc:
         mensaje = f"{type(exc).__name__}: {exc}"
         print(f"❌ Error en ciclo: {mensaje}")
@@ -735,17 +869,48 @@ def ejecutar_ciclo(page):
 
 if __name__ == "__main__":
     with sync_playwright() as p:
+        # 1. Le decimos a Chrome que arranque maximizado
         browser = p.chromium.launch(
             headless=False,
             channel="chrome",
+            args=["--start-maximized"] 
         )
 
-        context = browser.new_context()
-        page = context.new_page()
+        # 2. Comprobar si existe un archivo de sesión guardado
+        if SESSION_PATH.exists():
+            print("🔄 Sesión previa encontrada. Intentando reanudar...")
+            # 3. Agregamos no_viewport=True para que use todo el tamaño de la ventana
+            context = browser.new_context(storage_state=SESSION_PATH, no_viewport=True)
+            page = context.new_page()
+            
+            instalar_boton_manual(page)
+            
+            # Intentamos ir directo a Importaciones
+            page.goto(IMPORTACIONES_URL)
+            
+            try:
+                # Si la tabla carga, la sesión sigue viva
+                page.wait_for_selector("table", timeout=10000)
+                print("✅ Sesión reanudada con éxito. Saltando login.")
+            except:
+                print("⚠️ La sesión expiró o es inválida. Iniciando login desde cero...")
+                SESSION_PATH.unlink(missing_ok=True)  # Borramos el archivo viejo
+                context.close()  # Cerramos este contexto fallido
+                
+                # Empezamos desde cero con el viewport desactivado
+                context = browser.new_context(no_viewport=True)
+                page = context.new_page()
+                instalar_boton_manual(page)
+                login(page)
+                
+        else:
+            # No hay sesión previa, empezamos desde cero con el viewport desactivado
+            context = browser.new_context(no_viewport=True)
+            page = context.new_page()
+            instalar_boton_manual(page)
+            login(page)
 
-        instalar_boton_manual(page)
-        login(page)
-
+        # 3. Bucle principal de scraping
         while True:
             resultado = ejecutar_ciclo(page)
             print(f"\n🎯 Importaciones leídas: {len(resultado['importaciones'])}")

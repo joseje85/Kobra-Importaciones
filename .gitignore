@@ -2,3 +2,5 @@
 Kobra_Importaciones_Log.txt
 /Data
 /__pycache__
+/Sesion/sesion_kobra.json
+/Logs
